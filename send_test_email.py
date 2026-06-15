@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import smtplib
+import ssl
 import sys
 from email.message import EmailMessage
 
@@ -42,11 +43,23 @@ def send_test_email() -> int:
         message["Reply-To"] = settings.email_reply_to
     message.set_content(body)
 
+    context = None
+    if settings.smtp_skip_verify:
+        context = ssl._create_unverified_context()
+    else:
+        context = ssl.create_default_context()
+
     logger.info("Sending SMTP validation email to %s", settings.email_to)
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=60) as smtp:
+    
+    if settings.smtp_use_ssl:
+        smtp_client = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=60, context=context)
+    else:
+        smtp_client = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=60)
+
+    with smtp_client as smtp:
         smtp.ehlo()
-        if settings.smtp_use_tls:
-            smtp.starttls()
+        if not settings.smtp_use_ssl and settings.smtp_use_tls:
+            smtp.starttls(context=context)
             smtp.ehlo()
         if settings.smtp_username and settings.smtp_password:
             smtp.login(settings.smtp_username, settings.smtp_password)

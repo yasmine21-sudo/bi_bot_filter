@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import smtplib
+import ssl
 import sys
 import time
 from urllib.parse import urlparse
@@ -119,6 +120,8 @@ class Settings:
     smtp_host: str
     smtp_port: int
     smtp_use_tls: bool
+    smtp_use_ssl: bool
+    smtp_skip_verify: bool
     smtp_username: str | None
     smtp_password: str | None
     smtp_envelope_from: str | None
@@ -190,6 +193,21 @@ def load_settings() -> Settings:
     if not email_to:
         raise ValueError("EMAIL_TO must contain at least one recipient.")
 
+    smtp_port_val = int(get_env("SMTP_PORT", "587"))
+    smtp_use_ssl_val = get_env("SMTP_USE_SSL")
+    if smtp_use_ssl_val is None:
+        smtp_use_ssl = (smtp_port_val == 465)
+    else:
+        smtp_use_ssl = parse_bool(smtp_use_ssl_val, default=False)
+
+    smtp_use_tls_val = get_env("SMTP_USE_TLS")
+    if smtp_use_tls_val is None:
+        smtp_use_tls = not smtp_use_ssl
+    else:
+        smtp_use_tls = parse_bool(smtp_use_tls_val, default=True)
+
+    smtp_skip_verify = parse_bool(get_env("SMTP_SKIP_VERIFY"), default=False)
+
     return Settings(
         report_url=report_url,
         output_dir=Path(get_env("OUTPUT_DIR", "output")),
@@ -218,8 +236,10 @@ def load_settings() -> Settings:
         login_password_selector=get_env("LOGIN_PASSWORD_SELECTOR"),
         login_submit_selector=get_env("LOGIN_SUBMIT_SELECTOR"),
         smtp_host=get_env("SMTP_HOST", "") or "",
-        smtp_port=int(get_env("SMTP_PORT", "587")),
-        smtp_use_tls=parse_bool(get_env("SMTP_USE_TLS"), default=True),
+        smtp_port=smtp_port_val,
+        smtp_use_tls=smtp_use_tls,
+        smtp_use_ssl=smtp_use_ssl,
+        smtp_skip_verify=smtp_skip_verify,
         smtp_username=get_env("SMTP_USERNAME"),
         smtp_password=get_env("SMTP_PASSWORD"),
         smtp_envelope_from=get_env("SMTP_ENVELOPE_FROM"),
@@ -1550,12 +1570,24 @@ def send_email(settings: Settings, logger: logging.Logger, attachments: list[Pat
         img.attach = None  # satisfy linters; already constructed
         msg.attach(img)
 
+    context = None
+    if settings.smtp_skip_verify:
+        context = ssl._create_unverified_context()
+    else:
+        context = ssl.create_default_context()
+
     envelope_from = settings.smtp_envelope_from or settings.email_from
     logger.info("Sending email to %s with %s inline screenshot(s).", settings.email_to, len(attachments))
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=60) as smtp:
+    
+    if settings.smtp_use_ssl:
+        smtp_client = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=60, context=context)
+    else:
+        smtp_client = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=60)
+
+    with smtp_client as smtp:
         smtp.ehlo()
-        if settings.smtp_use_tls:
-            smtp.starttls()
+        if not settings.smtp_use_ssl and settings.smtp_use_tls:
+            smtp.starttls(context=context)
             smtp.ehlo()
         if settings.smtp_username and settings.smtp_password:
             smtp.login(settings.smtp_username, settings.smtp_password)
