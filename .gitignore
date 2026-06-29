@@ -6,3 +6,34 @@ logs/
 __pycache__/
 screenshots/
 screenshots_test/
+
+
+# Environment
+.env
+.env.*
+ray-env/
+
+# Emails
+mail_message.txt
+destinataire.xlsx
+
+# Logs
+logs/
+*.log
+
+# Screenshots
+screenshots/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+trial.py

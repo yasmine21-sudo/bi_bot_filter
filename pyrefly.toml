@@ -1,0 +1,9 @@
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]
+
+python-interpreter-path = ".venv/Scripts/python.exe"
+site-package-path = [
+    ".venv/Lib/site-packages",
+]

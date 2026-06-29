@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import html
 import logging
 import os
 import re
@@ -7,6 +9,7 @@ import smtplib
 import ssl
 import sys
 import time
+import zipfile
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -14,6 +17,7 @@ from datetime import timedelta
 from datetime import timezone as dt_timezone
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
 from zoneinfo import ZoneInfoNotFoundError
 
@@ -148,6 +152,26 @@ class ReportTab:
     is_active: bool = False
 
 
+@dataclass
+class CapturedScreenshot:
+    path: Path
+    tab_label: str
+    option: str | None = None
+
+
+@dataclass
+class RecipientGroup:
+    to: list[str]
+    cc: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MailTemplate:
+    subject_template: str
+    message1: str
+    message2: str
+
+
 def parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
@@ -161,10 +185,35 @@ def get_env(name: str, default: str | None = None) -> str | None:
     return value
 
 
+def get_required_env_str(name: str, default: str) -> str:
+    value = get_env(name, default)
+    if value is None:
+        raise ValueError(f"{name} is required.")
+    return value
+
+
+def get_env_int(name: str, default: str) -> int:
+    return int(get_required_env_str(name, default))
+
+
+def get_env_float(name: str, default: str) -> float:
+    return float(get_required_env_str(name, default))
+
+
+def get_env_path(name: str, default: str) -> Path:
+    return Path(get_required_env_str(name, default))
+
+
 def parse_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_email_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in re.split(r"[;,]", value) if item.strip()]
 
 
 def load_dotenv_file(path: str = ".env") -> None:
@@ -193,7 +242,7 @@ def load_settings() -> Settings:
     if not email_to:
         raise ValueError("EMAIL_TO must contain at least one recipient.")
 
-    smtp_port_val = int(get_env("SMTP_PORT", "587"))
+    smtp_port_val = get_env_int("SMTP_PORT", "587")
     smtp_use_ssl_val = get_env("SMTP_USE_SSL")
     if smtp_use_ssl_val is None:
         smtp_use_ssl = (smtp_port_val == 465)
@@ -210,18 +259,18 @@ def load_settings() -> Settings:
 
     return Settings(
         report_url=report_url,
-        output_dir=Path(get_env("OUTPUT_DIR", "output")),
-        log_dir=Path(get_env("LOG_DIR", "logs")),
+        output_dir=get_env_path("OUTPUT_DIR", "output"),
+        log_dir=get_env_path("LOG_DIR", "logs"),
         headless=parse_bool(get_env("HEADLESS"), default=True),
         browser_channel=get_env("BROWSER_CHANNEL"),
-        viewport_width=int(get_env("VIEWPORT_WIDTH", "1920")),
-        viewport_height=int(get_env("VIEWPORT_HEIGHT", "1080")),
-        device_scale_factor=float(get_env("DEVICE_SCALE_FACTOR", "2")),
-        navigation_timeout_ms=int(get_env("NAVIGATION_TIMEOUT_MS", "120000")),
-        report_render_timeout_ms=int(get_env("REPORT_RENDER_TIMEOUT_MS", "180000")),
-        report_stable_interval_ms=int(get_env("REPORT_STABLE_INTERVAL_MS", "2000")),
-        report_stable_polls=int(get_env("REPORT_STABLE_POLLS", "3")),
-        post_tab_click_wait_ms=int(get_env("POST_TAB_CLICK_WAIT_MS", "5000")),
+        viewport_width=get_env_int("VIEWPORT_WIDTH", "1920"),
+        viewport_height=get_env_int("VIEWPORT_HEIGHT", "1080"),
+        device_scale_factor=get_env_float("DEVICE_SCALE_FACTOR", "2"),
+        navigation_timeout_ms=get_env_int("NAVIGATION_TIMEOUT_MS", "120000"),
+        report_render_timeout_ms=get_env_int("REPORT_RENDER_TIMEOUT_MS", "180000"),
+        report_stable_interval_ms=get_env_int("REPORT_STABLE_INTERVAL_MS", "2000"),
+        report_stable_polls=get_env_int("REPORT_STABLE_POLLS", "3"),
+        post_tab_click_wait_ms=get_env_int("POST_TAB_CLICK_WAIT_MS", "5000"),
         screenshot_prefix=get_env("SCREENSHOT_PREFIX", "pbirs") or "pbirs",
         timezone=get_env("TIMEZONE", "UTC") or "UTC",
         auth_mode=(get_env("AUTH_MODE", "none") or "none").strip().lower(),
@@ -304,6 +353,15 @@ def sanitize_filename(value: str) -> str:
     return cleaned.strip("._") or "sheet"
 
 
+def normalize_option_key(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip()).casefold()
+
+
+def render_option_template(value: str, option: str | None) -> str:
+    rendered = value.replace("% selected option %", option or "")
+    return re.sub(r"\s{2,}", " ", rendered).strip()
+
+
 def require_email_config(settings: Settings) -> None:
     required = {
         "SMTP_HOST": settings.smtp_host,
@@ -371,6 +429,107 @@ def validate_timezone(settings: Settings, logger: logging.Logger) -> None:
         "If you want a stable offset without tzdata, use something like '+01:00'.",
         settings.timezone,
     )
+
+
+def load_mail_template(path: str = "mail_message.txt") -> MailTemplate:
+    values: dict[str, str] = {}
+    template_path = Path(path)
+    if not template_path.exists():
+        raise FileNotFoundError(f"Mail template file was not found: {template_path}")
+
+    for raw_line in template_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        try:
+            parsed_value = ast.literal_eval(raw_value)
+        except (SyntaxError, ValueError):
+            parsed_value = raw_value.strip('"').strip("'")
+        values[key] = str(parsed_value)
+
+    subject_template = values.get("object")
+    if not subject_template:
+        raise ValueError("mail_message.txt must define an 'object' value.")
+
+    return MailTemplate(
+        subject_template=subject_template,
+        message1=values.get("message1", ""),
+        message2=values.get("message2", ""),
+    )
+
+
+def _read_xlsx_rows(path: Path) -> list[list[str]]:
+    ns = {
+        "a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+
+    with zipfile.ZipFile(path) as workbook_zip:
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in workbook_zip.namelist():
+            shared_root = ET.fromstring(workbook_zip.read("xl/sharedStrings.xml"))
+            for string_item in shared_root.findall("a:si", ns):
+                texts = [node.text or "" for node in string_item.findall(".//a:t", ns)]
+                shared_strings.append("".join(texts))
+
+        workbook_root = ET.fromstring(workbook_zip.read("xl/workbook.xml"))
+        rels_root = ET.fromstring(workbook_zip.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels_root}
+
+        first_sheet = workbook_root.find("a:sheets/a:sheet", ns)
+        if first_sheet is None:
+            return []
+
+        rel_id = first_sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
+        sheet_target = "xl/" + rel_map[rel_id]
+        sheet_root = ET.fromstring(workbook_zip.read(sheet_target))
+
+        rows: list[list[str]] = []
+        for row in sheet_root.findall("a:sheetData/a:row", ns):
+            values: list[str] = []
+            for cell in row.findall("a:c", ns):
+                cell_type = cell.attrib.get("t")
+                value_node = cell.find("a:v", ns)
+                value = ""
+                if cell_type == "s" and value_node is not None and value_node.text is not None:
+                    value = shared_strings[int(value_node.text)]
+                elif cell_type == "inlineStr":
+                    inline_node = cell.find("a:is", ns)
+                    if inline_node is not None:
+                        value = "".join(node.text or "" for node in inline_node.findall(".//a:t", ns))
+                elif value_node is not None and value_node.text is not None:
+                    value = value_node.text
+                values.append(value.strip())
+            rows.append(values)
+        return rows
+
+
+def load_recipient_mappings(path: str = "destinataire.xlsx") -> dict[str, RecipientGroup]:
+    workbook_path = Path(path)
+    if not workbook_path.exists():
+        raise FileNotFoundError(f"Recipient workbook was not found: {workbook_path}")
+
+    rows = _read_xlsx_rows(workbook_path)
+    if len(rows) < 2:
+        return {}
+
+    mappings: dict[str, RecipientGroup] = {}
+    for row in rows[1:]:
+        if not row:
+            continue
+        option = row[0].strip() if len(row) > 0 and row[0] else ""
+        if not option:
+            continue
+        to_value = row[1] if len(row) > 1 else ""
+        cc_value = row[2] if len(row) > 2 else ""
+        mappings[normalize_option_key(option)] = RecipientGroup(
+            to=parse_email_list(to_value),
+            cc=parse_email_list(cc_value),
+        )
+    return mappings
 
 
 def build_context(playwright: Playwright, settings: Settings) -> tuple[BrowserContext, Page]:
@@ -1131,8 +1290,8 @@ def capture_tab_screenshot(page: Page, frame: Any, output_path: Path) -> None:
     )
 
 
-def capture_report(settings: Settings, logger: logging.Logger) -> tuple[list[Path], list[str]]:
-    screenshots: list[Path] = []
+def capture_report(settings: Settings, logger: logging.Logger) -> tuple[list[CapturedScreenshot], list[str]]:
+    screenshots: list[CapturedScreenshot] = []
     errors: list[str] = []
 
     if sync_playwright is None:
@@ -1222,7 +1381,7 @@ def capture_report(settings: Settings, logger: logging.Logger) -> tuple[list[Pat
                             output_path = dated_output_dir / filename
                             
                             capture_tab_screenshot(page, report_frame, output_path)
-                            screenshots.append(output_path)
+                            screenshots.append(CapturedScreenshot(path=output_path, tab_label=tab.label, option=option))
                             logger.info("Saved screenshot: %s", output_path)
                             screenshot_idx += 1
                         except Exception as error:
@@ -1246,7 +1405,7 @@ def capture_report(settings: Settings, logger: logging.Logger) -> tuple[list[Pat
                         filename = f"{index:02d}_{sanitize_filename(tab.label)}_{run_stamp}.png"
                         output_path = dated_output_dir / filename
                         capture_tab_screenshot(page, report_frame, output_path)
-                        screenshots.append(output_path)
+                        screenshots.append(CapturedScreenshot(path=output_path, tab_label=tab.label, option=None))
                         logger.info("Saved screenshot: %s", output_path)
                     except Exception as error:
                         message = f"Tab '{tab.label}' failed: {error}"
@@ -1278,18 +1437,69 @@ def _extract_sheet_label(filename: str) -> str:
     return " ".join(meaningful) if meaningful else stem
 
 
+def _render_html_message_block(message: str, option: str | None) -> str:
+    rendered = render_option_template(message, option)
+    if not rendered:
+        return ""
+
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", rendered) if part.strip()]
+    blocks: list[str] = []
+    for paragraph in paragraphs:
+        html_text = html.escape(paragraph).replace("\n", "<br/>")
+        blocks.append(
+            f"""
+            <tr>
+              <td style="padding: 0 32px 24px 32px;">
+                <div style="font-size: 14px; line-height: 1.7; color: #334155;
+                            font-family: 'Segoe UI', Arial, sans-serif;">
+                  {html_text}
+                </div>
+              </td>
+            </tr>
+            """
+        )
+    return "\n".join(blocks)
+
+
+def _errors_for_option(errors: list[str], option: str | None) -> list[str]:
+    if option is None:
+        return [error for error in errors if "(Option:" not in error]
+
+    marker = f"(Option: '{option}')"
+    return [error for error in errors if marker in error]
+
+
+def _resolve_recipients_for_option(
+    option: str | None,
+    mappings: dict[str, RecipientGroup],
+    settings: Settings,
+    logger: logging.Logger,
+) -> RecipientGroup:
+    if option is not None:
+        mapped = mappings.get(normalize_option_key(option))
+        if mapped and mapped.to:
+            return mapped
+        logger.warning(
+            "No recipient mapping found for option '%s'. Falling back to EMAIL_TO from .env.",
+            option,
+        )
+    return RecipientGroup(to=settings.email_to, cc=[])
+
+
 def _build_html_email(
     settings: Settings,
     stamp: str,
-    attachments: list[Path],
+    captures: list[CapturedScreenshot],
     errors: list[str],
+    template: MailTemplate,
+    option: str | None,
+    subject: str,
 ) -> str:
-    """Build a premium HTML email body with inline CID references for each screenshot."""
+    """Build an HTML email body with inline CID references for each screenshot."""
 
-    # ── per-figure HTML blocks ──
     figure_blocks: list[str] = []
-    for index, attachment in enumerate(attachments, start=1):
-        label = _extract_sheet_label(attachment.name)
+    for index, capture in enumerate(captures, start=1):
+        label = capture.tab_label
         cid = f"screenshot_{index}"
         figure_blocks.append(
             f"""
@@ -1341,8 +1551,9 @@ def _build_html_email(
         )
 
     figures_html = "\n".join(figure_blocks)
+    intro_html = _render_html_message_block(template.message1, option)
+    closing_html = _render_html_message_block(template.message2, option)
 
-    # ── error section (if any) ──
     errors_html = ""
     if errors:
         error_items = "".join(
@@ -1388,7 +1599,7 @@ def _build_html_email(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>{settings.email_subject_prefix}</title>
+  <title>{html.escape(subject)}</title>
 </head>
 <body style="margin: 0; padding: 0; background-color: #f1f5f9;
              font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -1411,11 +1622,11 @@ def _build_html_email(
               <p style="margin: 0 0 6px 0; font-size: 28px; font-weight: 700;
                         color: #ffffff; letter-spacing: -0.5px;
                         font-family: 'Segoe UI', Arial, sans-serif;">
-                Capture Quotidienne des Rapports
+                Diagnostic Exercice 2026
               </p>
               <p style="margin: 0; font-size: 14px; color: rgba(255,255,255,0.85);
                         font-family: 'Segoe UI', Arial, sans-serif;">
-                {settings.email_subject_prefix}
+                {html.escape(subject)}
               </p>
             </td>
           </tr>
@@ -1450,7 +1661,7 @@ def _build_html_email(
                     <p style="margin: 0; font-size: 22px; font-weight: 700;
                               color: #1e293b;
                               font-family: 'Segoe UI', Arial, sans-serif;">
-                      {len(attachments)}
+                      {len(captures)}
                     </p>
                   </td>
                   <!-- Timestamp -->
@@ -1472,12 +1683,14 @@ def _build_html_email(
             </td>
           </tr>
 
+          {intro_html}
+
           <!-- ═══ Section title ═══ -->
           <tr>
             <td style="padding: 8px 32px 16px 32px;">
               <p style="margin: 0; font-size: 18px; font-weight: 700; color: #1e293b;
                         font-family: 'Segoe UI', Arial, sans-serif;">
-                Captures d'écran du rapport
+                Captures d'écran du rapport{f" - {html.escape(option)}" if option else ""}
               </p>
               <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b;
                         font-family: 'Segoe UI', Arial, sans-serif;">
@@ -1488,6 +1701,8 @@ def _build_html_email(
 
           <!-- ═══ Figures ═══ -->
           {figures_html}
+
+          {closing_html}
 
           <!-- ═══ Errors (if any) ═══ -->
           {errors_html}
@@ -1516,59 +1731,17 @@ def _build_html_email(
 </html>"""
 
 
-def send_email(settings: Settings, logger: logging.Logger, attachments: list[Path], errors: list[str]) -> None:
+def send_email(settings: Settings, logger: logging.Logger, captures: list[CapturedScreenshot], errors: list[str]) -> None:
     require_email_config(settings)
-    if not attachments:
+    if not captures:
         raise ValueError("No screenshots were generated, so the email was not sent.")
 
+    template = load_mail_template()
+    recipient_mappings = load_recipient_mappings()
     stamp = timestamp_readable(settings.timezone)
-    status_prefix = "[PARTIAL] " if errors else ""
-    subject = f"{status_prefix}{settings.email_subject_prefix} - {stamp}"
-
-    html_body = _build_html_email(settings, stamp, attachments, errors)
-
-    # ── plain-text fallback ──
-    plain_lines = [
-        f"{settings.email_subject_prefix}",
-        f"Horodatage : {stamp}",
-        f"URL du rapport : {settings.report_url}",
-        f"Feuilles capturées : {len(attachments)}",
-        "",
-    ]
-    for index, attachment in enumerate(attachments, start=1):
-        label = _extract_sheet_label(attachment.name)
-        plain_lines.append(f"  {index}. {label}  (voir pièce jointe : {attachment.name})")
-    if errors:
-        plain_lines.append("")
-        plain_lines.append("Erreurs :")
-        plain_lines.extend(f"  - {error}" for error in errors)
-
-    # ── build MIME message ──
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
     from email.mime.image import MIMEImage
-
-    msg = MIMEMultipart("related")
-    msg["Subject"] = subject
-    msg["From"] = settings.email_from
-    msg["To"] = ", ".join(settings.email_to)
-    if settings.email_reply_to:
-        msg["Reply-To"] = settings.email_reply_to
-
-    # Attach the HTML + plain-text alternative
-    alt_part = MIMEMultipart("alternative")
-    alt_part.attach(MIMEText("\n".join(plain_lines), "plain", "utf-8"))
-    alt_part.attach(MIMEText(html_body, "html", "utf-8"))
-    msg.attach(alt_part)
-
-    # Embed each screenshot as an inline CID image
-    for index, attachment in enumerate(attachments, start=1):
-        with attachment.open("rb") as fh:
-            img = MIMEImage(fh.read(), _subtype="png")
-        img.add_header("Content-ID", f"<screenshot_{index}>")
-        img.add_header("Content-Disposition", "inline", filename=attachment.name)
-        img.attach = None  # satisfy linters; already constructed
-        msg.attach(img)
 
     context = None
     if settings.smtp_skip_verify:
@@ -1577,8 +1750,11 @@ def send_email(settings: Settings, logger: logging.Logger, attachments: list[Pat
         context = ssl.create_default_context()
 
     envelope_from = settings.smtp_envelope_from or settings.email_from
-    logger.info("Sending email to %s with %s inline screenshot(s).", settings.email_to, len(attachments))
-    
+
+    grouped_captures: dict[str | None, list[CapturedScreenshot]] = {}
+    for capture in captures:
+        grouped_captures.setdefault(capture.option, []).append(capture)
+
     if settings.smtp_use_ssl:
         smtp_client = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=60, context=context)
     else:
@@ -1591,25 +1767,85 @@ def send_email(settings: Settings, logger: logging.Logger, attachments: list[Pat
             smtp.ehlo()
         if settings.smtp_username and settings.smtp_password:
             smtp.login(settings.smtp_username, settings.smtp_password)
-        try:
-            smtp.sendmail(envelope_from, settings.email_to, msg.as_string())
-        except smtplib.SMTPDataError as error:
-            response_text = ""
-            if len(error.args) > 1 and isinstance(error.args[1], (bytes, bytearray)):
-                response_text = error.args[1].decode("utf-8", errors="replace")
-            elif len(error.args) > 1:
-                response_text = str(error.args[1])
+        for option, option_captures in grouped_captures.items():
+            option_errors = _errors_for_option(errors, option)
+            recipients = _resolve_recipients_for_option(option, recipient_mappings, settings, logger)
+            if not recipients.to:
+                raise ValueError(
+                    f"No primary recipient was found for option '{option or 'default'}'. "
+                    "Check destinataire.xlsx or EMAIL_TO."
+                )
 
-            if error.smtp_code == 550 and "5.7.60" in response_text:
-                raise RuntimeError(
-                    "SMTP rejected the sender with '5.7.60 Send As denied'. "
-                    f"Authenticated SMTP user: {settings.smtp_username or '(anonymous)'} | "
-                    f"EMAIL_FROM: {settings.email_from} | "
-                    f"SMTP_ENVELOPE_FROM: {envelope_from}. "
-                    "Set EMAIL_FROM and SMTP_ENVELOPE_FROM to a mailbox this SMTP account is allowed to send as, "
-                    "or ask your mail admin to grant 'Send As' permission for that sender."
-                ) from error
-            raise
+            status_prefix = "[PARTIAL] " if option_errors else ""
+            subject = f"{status_prefix}{render_option_template(template.subject_template, option)}"
+            html_body = _build_html_email(settings, stamp, option_captures, option_errors, template, option, subject)
+
+            plain_lines = [
+                subject,
+                f"Horodatage : {stamp}",
+                f"URL du rapport : {settings.report_url}",
+                f"Option sélectionnée : {option or 'N/A'}",
+                f"Feuilles capturées : {len(option_captures)}",
+                "",
+                render_option_template(template.message1, option),
+                "",
+            ]
+            for index, capture in enumerate(option_captures, start=1):
+                plain_lines.append(f"  {index}. {capture.tab_label}  (voir image inline : {capture.path.name})")
+            if template.message2:
+                plain_lines.extend(["", render_option_template(template.message2, option)])
+            if option_errors:
+                plain_lines.extend(["", "Erreurs :", *[f"  - {error}" for error in option_errors]])
+
+            msg = MIMEMultipart("related")
+            msg["Subject"] = subject
+            msg["From"] = settings.email_from
+            msg["To"] = ", ".join(recipients.to)
+            if recipients.cc:
+                msg["Cc"] = ", ".join(recipients.cc)
+            if settings.email_reply_to:
+                msg["Reply-To"] = settings.email_reply_to
+
+            alt_part = MIMEMultipart("alternative")
+            alt_part.attach(MIMEText("\n".join(plain_lines), "plain", "utf-8"))
+            alt_part.attach(MIMEText(html_body, "html", "utf-8"))
+            msg.attach(alt_part)
+
+            for index, capture in enumerate(option_captures, start=1):
+                with capture.path.open("rb") as fh:
+                    img = MIMEImage(fh.read(), _subtype="png")
+                img.add_header("Content-ID", f"<screenshot_{index}>")
+                img.add_header("Content-Disposition", "inline", filename=capture.path.name)
+                msg.attach(img)
+
+            all_recipients = recipients.to + recipients.cc
+            logger.info(
+                "Sending email for option '%s' to %s (cc=%s) with %s inline screenshot(s).",
+                option or "default",
+                recipients.to,
+                recipients.cc,
+                len(option_captures),
+            )
+
+            try:
+                smtp.sendmail(envelope_from, all_recipients, msg.as_string())
+            except smtplib.SMTPDataError as error:
+                response_text = ""
+                if len(error.args) > 1 and isinstance(error.args[1], (bytes, bytearray)):
+                    response_text = error.args[1].decode("utf-8", errors="replace")
+                elif len(error.args) > 1:
+                    response_text = str(error.args[1])
+
+                if error.smtp_code == 550 and "5.7.60" in response_text:
+                    raise RuntimeError(
+                        "SMTP rejected the sender with '5.7.60 Send As denied'. "
+                        f"Authenticated SMTP user: {settings.smtp_username or '(anonymous)'} | "
+                        f"EMAIL_FROM: {settings.email_from} | "
+                        f"SMTP_ENVELOPE_FROM: {envelope_from}. "
+                        "Set EMAIL_FROM and SMTP_ENVELOPE_FROM to a mailbox this SMTP account is allowed to send as, "
+                        "or ask your mail admin to grant 'Send As' permission for that sender."
+                    ) from error
+                raise
 
 
 def main() -> int:
