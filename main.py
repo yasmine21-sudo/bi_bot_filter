@@ -123,6 +123,7 @@ class Settings:
     login_submit_selector: str | None
     smtp_host: str
     smtp_port: int
+    smtp_timeout_seconds: int
     smtp_use_tls: bool
     smtp_use_ssl: bool
     smtp_skip_verify: bool
@@ -286,6 +287,7 @@ def load_settings() -> Settings:
         login_submit_selector=get_env("LOGIN_SUBMIT_SELECTOR"),
         smtp_host=get_env("SMTP_HOST", "") or "",
         smtp_port=smtp_port_val,
+        smtp_timeout_seconds=get_env_int("SMTP_TIMEOUT_SECONDS", "300"),
         smtp_use_tls=smtp_use_tls,
         smtp_use_ssl=smtp_use_ssl,
         smtp_skip_verify=smtp_skip_verify,
@@ -387,6 +389,9 @@ def validate_settings(settings: Settings) -> None:
 
     if settings.auth_mode not in {"none", "basic", "form", "integrated"}:
         raise ValueError("AUTH_MODE must be one of: none, basic, form, integrated.")
+
+    if settings.smtp_timeout_seconds <= 0:
+        raise ValueError("SMTP_TIMEOUT_SECONDS must be greater than 0.")
 
 
 def is_ipv4_host(hostname: str | None) -> bool:
@@ -1756,9 +1761,18 @@ def send_email(settings: Settings, logger: logging.Logger, captures: list[Captur
         grouped_captures.setdefault(capture.option, []).append(capture)
 
     if settings.smtp_use_ssl:
-        smtp_client = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=60, context=context)
+        smtp_client = smtplib.SMTP_SSL(
+            settings.smtp_host,
+            settings.smtp_port,
+            timeout=settings.smtp_timeout_seconds,
+            context=context,
+        )
     else:
-        smtp_client = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=60)
+        smtp_client = smtplib.SMTP(
+            settings.smtp_host,
+            settings.smtp_port,
+            timeout=settings.smtp_timeout_seconds,
+        )
 
     with smtp_client as smtp:
         smtp.ehlo()
@@ -1829,6 +1843,15 @@ def send_email(settings: Settings, logger: logging.Logger, captures: list[Captur
 
             try:
                 smtp.sendmail(envelope_from, all_recipients, msg.as_string())
+            except (TimeoutError, smtplib.SMTPServerDisconnected) as error:
+                raise RuntimeError(
+                    "SMTP connection dropped while sending the email body. "
+                    f"Current settings: host={settings.smtp_host}, port={settings.smtp_port}, "
+                    f"use_ssl={settings.smtp_use_ssl}, use_tls={settings.smtp_use_tls}, "
+                    f"timeout={settings.smtp_timeout_seconds}s. "
+                    "Try increasing SMTP_TIMEOUT_SECONDS in .env, or if you are using Gmail, "
+                    "prefer SMTP_PORT=465 with SMTP_USE_SSL=true and SMTP_USE_TLS=false."
+                ) from error
             except smtplib.SMTPDataError as error:
                 response_text = ""
                 if len(error.args) > 1 and isinstance(error.args[1], (bytes, bytearray)):

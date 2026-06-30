@@ -52,9 +52,18 @@ def send_test_email() -> int:
     logger.info("Sending SMTP validation email to %s", settings.email_to)
     
     if settings.smtp_use_ssl:
-        smtp_client = smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=60, context=context)
+        smtp_client = smtplib.SMTP_SSL(
+            settings.smtp_host,
+            settings.smtp_port,
+            timeout=settings.smtp_timeout_seconds,
+            context=context,
+        )
     else:
-        smtp_client = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=60)
+        smtp_client = smtplib.SMTP(
+            settings.smtp_host,
+            settings.smtp_port,
+            timeout=settings.smtp_timeout_seconds,
+        )
 
     with smtp_client as smtp:
         smtp.ehlo()
