@@ -138,6 +138,8 @@ class Settings:
     filter_slicer_name: str | None
     filter_slicer_page: str | None
     filter_exclude_options: list[str]
+    slicer_dropdown_wait_ms: int
+    slicer_apply_wait_ms: int
 
     @property
     def browser_profile_dir(self) -> Path:
@@ -302,6 +304,8 @@ def load_settings() -> Settings:
         filter_slicer_name=get_env("FILTER_SLICER_NAME"),
         filter_slicer_page=get_env("FILTER_SLICER_PAGE"),
         filter_exclude_options=parse_csv(get_env("FILTER_EXCLUDE_OPTIONS")),
+        slicer_dropdown_wait_ms=get_env_int("SLICER_DROPDOWN_WAIT_MS", "0"),
+        slicer_apply_wait_ms=get_env_int("SLICER_APPLY_WAIT_MS", "0"),
     )
 
 
@@ -392,6 +396,12 @@ def validate_settings(settings: Settings) -> None:
 
     if settings.smtp_timeout_seconds <= 0:
         raise ValueError("SMTP_TIMEOUT_SECONDS must be greater than 0.")
+
+    if settings.slicer_dropdown_wait_ms < 0:
+        raise ValueError("SLICER_DROPDOWN_WAIT_MS must be greater than or equal to 0.")
+
+    if settings.slicer_apply_wait_ms < 0:
+        raise ValueError("SLICER_APPLY_WAIT_MS must be greater than or equal to 0.")
 
 
 def is_ipv4_host(hostname: str | None) -> bool:
@@ -1174,31 +1184,120 @@ def activate_tab(frame: Any, report_handle: Any | None, tab: ReportTab, settings
 
 
 def get_slicer_options(frame: Any, settings: Settings, logger: logging.Logger) -> list[str]:
-    """Open the slicer dropdown, list all options, close it, and filter by exclusion list."""
+    """Open the slicer dropdown, scroll through all options, close it, and filter by exclusion list.
+
+    Power BI uses virtual scrolling inside the slicer dropdown, so only a limited
+    number of rows are rendered in the DOM at any time.  We repeatedly scroll the
+    list container and collect new items until two consecutive passes yield the same
+    set of options, at which point we know we have reached the bottom.
+    """
     slicer_name = settings.filter_slicer_name
     if not slicer_name:
         return []
-    
+
     logger.info("Opening slicer '%s' dropdown to extract options...", slicer_name)
     try:
-        # Locate dropdown menu inside the slicer
+        # Locate and open the dropdown
         slicer_dropdown = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-dropdown-menu")
         slicer_dropdown.click()
-        
-        # Wait for options to render
+
+        if settings.slicer_dropdown_wait_ms > 0:
+            logger.info("Waiting %.1f seconds for slicer dropdown to open...", settings.slicer_dropdown_wait_ms / 1000)
+            time.sleep(settings.slicer_dropdown_wait_ms / 1000)
+
+        # Wait for at least one option to render
         frame.locator(".slicerText").first.wait_for(state="visible", timeout=10000)
-        
-        # Extract option texts
-        options_elements = frame.locator(".slicerText").all()
-        options = [el.inner_text().strip() for el in options_elements if el.inner_text().strip()]
-        
+
+        # Scroll through the virtualised list until no new options are discovered.
+        # We use the scrollable container inside the dropdown panel (.slicerCheckboxInput
+        # lives inside .powerbiglass or a generic scrollable div).  If the exact
+        # selector isn't found we fall back to JavaScript scrolling on the first
+        # scrollable ancestor of the visible items.
+        collected: dict[str, bool] = {}  # preserves insertion order (Python 3.7+)
+        previous_count = -1
+        max_scroll_attempts = 50  # safety cap
+
+        for attempt in range(max_scroll_attempts):
+            # Harvest whatever is currently rendered
+            elements = frame.locator(".slicerText").all()
+            for el in elements:
+                try:
+                    text = el.inner_text().strip()
+                    if text:
+                        collected[text] = True
+                except Exception:
+                    pass
+
+            current_count = len(collected)
+            logger.debug(
+                "Slicer scroll pass %d: %d options collected so far",
+                attempt + 1,
+                current_count,
+            )
+
+            if current_count == previous_count:
+                # No new options found on this pass — we've reached the bottom
+                break
+            previous_count = current_count
+
+            # Scroll the dropdown list downward.  Try a CSS-scoped evaluate first,
+            # then fall back to scrolling via the last visible element.
+            scrolled = frame.evaluate(
+                """
+                () => {
+                  // Common Power BI slicer scroll containers
+                  const selectors = [
+                    '.slicer-dropdown-popup',
+                    '.slicer-dropdown-content',
+                    '.slicerBody',
+                    '.scroll-wrapper',
+                    '.virtualizedScrollerContent',
+                  ];
+                  for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.scrollHeight > el.clientHeight) {
+                      el.scrollTop += 300;
+                      return true;
+                    }
+                  }
+                  // Fallback: scroll the nearest scrollable ancestor of a .slicerText
+                  const item = document.querySelector('.slicerText');
+                  if (!item) return false;
+                  let node = item.parentElement;
+                  while (node) {
+                    if (node.scrollHeight > node.clientHeight) {
+                      node.scrollTop += 300;
+                      return true;
+                    }
+                    node = node.parentElement;
+                  }
+                  return false;
+                }
+                """
+            )
+            if not scrolled:
+                # Nothing scrollable found — single-page list, stop here
+                break
+
+            # Small pause so the virtualised renderer can update
+            time.sleep(0.3)
+
+        else:
+            logger.warning(
+                "Reached max scroll attempts (%d) while reading slicer options; "
+                "some options may be missing.",
+                max_scroll_attempts,
+            )
+
+        options = list(collected.keys())
+
         # Close the dropdown
         slicer_dropdown.click()
-        
+
         # Filter options
         exclude = set(settings.filter_exclude_options)
         filtered_options = [opt for opt in options if opt not in exclude]
-        
+
         logger.info("Retrieved %d slicer options (filtered: %s)", len(filtered_options), filtered_options)
         return filtered_options
     except Exception as error:
@@ -1206,9 +1305,16 @@ def get_slicer_options(frame: Any, settings: Settings, logger: logging.Logger) -
         raise
 
 
+
 def select_slicer_option(frame: Any, option_text: str, settings: Settings, logger: logging.Logger) -> None:
-    """Clear selections, open the slicer dropdown, click the target option, and close it.
-    Uses a forced click to bypass overlay interception issues.
+    """Clear selections, open the slicer dropdown, scroll to the target option, and click it.
+
+    Power BI uses virtual scrolling in its slicer dropdowns, so items that exist in
+    the DOM may be marked as CSS-hidden (off-screen) rather than truly absent.
+    Playwright's wait_for(state='visible') therefore times out even though the element
+    is present.  Instead we drive the selection entirely through JavaScript so that
+    visibility is not a constraint: we scroll the dropdown list until we find the
+    matching row and dispatch a native click on it.
     """
     slicer_name = settings.filter_slicer_name
     if not slicer_name:
@@ -1216,30 +1322,164 @@ def select_slicer_option(frame: Any, option_text: str, settings: Settings, logge
 
     logger.info("Selecting slicer option '%s' on slicer '%s'", option_text, slicer_name)
     try:
-        # 1. Clear previous selections if clear button is visible
+        # 1. Clear previous selections if the clear button is visible
         clear_btn = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-header-clear")
         if clear_btn.is_visible():
             clear_btn.click(force=True)
             logger.info("Cleared existing selections for slicer '%s'", slicer_name)
+            # Give the slicer a moment to settle after clearing before re-opening
+            time.sleep(1.0)
 
-        # 2. Open dropdown
+        # 2. Open the dropdown — retry a few times in case the slicer is still
+        #    re-rendering after the clear or after the previous tab activation.
         slicer_dropdown = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-dropdown-menu")
+        dropdown_wait_s = max(settings.slicer_dropdown_wait_ms, 2000) / 1000
+
+        dropdown_open = False
+        for attempt in range(3):
+            slicer_dropdown.click(force=True)
+            logger.info(
+                "Waiting %.1f s for slicer dropdown to open (attempt %d/3)...",
+                dropdown_wait_s,
+                attempt + 1,
+            )
+            time.sleep(dropdown_wait_s)
+
+            # Consider the dropdown open when at least one slicerText element is attached
+            if frame.locator(".slicerText").count() > 0:
+                dropdown_open = True
+                break
+            logger.warning("Slicer dropdown did not open on attempt %d, retrying...", attempt + 1)
+
+        if not dropdown_open:
+            raise RuntimeError(
+                f"Could not open slicer dropdown for '{slicer_name}' after 3 attempts."
+            )
+
+        # 3. Reset the dropdown scroll to the top so we always start from position 0
+        frame.evaluate(
+            """
+            () => {
+              const selectors = [
+                '.slicer-dropdown-popup',
+                '.slicer-dropdown-content',
+                '.slicerBody',
+                '.scroll-wrapper',
+                '.virtualizedScrollerContent',
+              ];
+              for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el && el.scrollHeight > el.clientHeight) {
+                  el.scrollTop = 0;
+                  return;
+                }
+              }
+              // Fallback: reset via the nearest scrollable ancestor of a slicerText
+              const item = document.querySelector('.slicerText');
+              if (!item) return;
+              let node = item.parentElement;
+              while (node) {
+                if (node.scrollHeight > node.clientHeight) { node.scrollTop = 0; return; }
+                node = node.parentElement;
+              }
+            }
+            """
+        )
+        time.sleep(0.3)
+
+        # 4. Scroll through the virtual list in JS and click the matching option.
+        #    We compare trimmed innerText so whitespace differences don't matter.
+        logger.info("Searching for option '%s' in slicer dropdown...", option_text)
+        clicked = frame.evaluate(
+            """
+            async (targetText) => {
+              // Locate the scrollable container
+              const containerSelectors = [
+                '.slicer-dropdown-popup',
+                '.slicer-dropdown-content',
+                '.slicerBody',
+                '.scroll-wrapper',
+                '.virtualizedScrollerContent',
+              ];
+              let container = null;
+              for (const sel of containerSelectors) {
+                const el = document.querySelector(sel);
+                if (el && el.scrollHeight > el.clientHeight) {
+                  container = el;
+                  break;
+                }
+              }
+              if (!container) {
+                // Fallback: nearest scrollable ancestor of the first slicerText
+                const item = document.querySelector('.slicerText');
+                if (item) {
+                  let node = item.parentElement;
+                  while (node) {
+                    if (node.scrollHeight > node.clientHeight) { container = node; break; }
+                    node = node.parentElement;
+                  }
+                }
+              }
+
+              const clickMatch = () => {
+                for (const el of document.querySelectorAll('.slicerText')) {
+                  if ((el.innerText || el.textContent || '').trim() === targetText) {
+                    // Walk up to the clickable row element
+                    const row = el.closest(
+                      '.slicerCheckboxInput, .slicerItemContainer, [role="checkbox"], [role="option"]'
+                    ) || el.parentElement || el;
+                    row.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    return true;
+                  }
+                }
+                return false;
+              };
+
+              // First pass without scrolling
+              if (clickMatch()) return true;
+
+              if (!container) return false;
+
+              // Scroll in increments and retry after each step
+              const maxScrolls = 60;
+              for (let i = 0; i < maxScrolls; i++) {
+                const before = container.scrollTop;
+                container.scrollTop += 200;
+                await new Promise(r => setTimeout(r, 200));
+                if (clickMatch()) return true;
+                if (container.scrollTop === before) break; // reached the bottom
+              }
+              return false;
+            }
+            """,
+            option_text,
+        )
+
+        if clicked:
+            logger.info("Clicked option '%s' via JavaScript scroll", option_text)
+        else:
+            # Fallback: Playwright force-click (works when item is in DOM even if hidden)
+            logger.warning(
+                "JS scroll-click did not find '%s'; falling back to Playwright force-click.",
+                option_text,
+            )
+            option_locator = frame.locator(f".slicerText:has-text('{option_text}')").first
+            option_locator.scroll_into_view_if_needed()
+            option_locator.click(force=True)
+            logger.info("Clicked option '%s' via Playwright fallback", option_text)
+
+        # 5. Close the dropdown
         slicer_dropdown.click(force=True)
 
-        # 3. Locate the target option
-        option_locator = frame.locator(f".slicerText:has-text('{option_text}')").first
-        option_locator.wait_for(state="visible", timeout=10000)
-        # Ensure the element is in view before clicking
-        option_locator.scroll_into_view_if_needed()
-        # Use forced click to avoid overlay interception
-        option_locator.click(force=True)
-        logger.info("Clicked option '%s'", option_text)
-
-        # 4. Close dropdown
-        slicer_dropdown.click(force=True)
-
-        # Allow the report to stabilize after changing the filter
-        time.sleep(settings.post_tab_click_wait_ms / 1000)
+        # 6. Allow the report to stabilise after the filter change
+        if settings.slicer_apply_wait_ms > 0:
+            logger.info(
+                "Waiting %.1f seconds for slicer option application to stabilize...",
+                settings.slicer_apply_wait_ms / 1000,
+            )
+            time.sleep(settings.slicer_apply_wait_ms / 1000)
+        else:
+            time.sleep(settings.post_tab_click_wait_ms / 1000)
         wait_for_report_ready(frame, settings, logger, f"option select: {option_text}")
     except Exception as error:
         logger.exception(
@@ -1249,6 +1489,7 @@ def select_slicer_option(frame: Any, option_text: str, settings: Settings, logge
             error,
         )
         raise
+
 
 
 def capture_tab_screenshot(page: Page, frame: Any, output_path: Path) -> None:
