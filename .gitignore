@@ -3,6 +3,8 @@
 .browser-profile-w*/
 output/
 logs/
+data/*.xlsx
+data/archive/
 .env
 __pycache__/
 screenshots/

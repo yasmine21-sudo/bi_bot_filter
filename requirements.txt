@@ -1,3 +1,4 @@
 playwright>=1.54,<2.0
 flask>=3.0,<4.0
 openpyxl>=3.1,<4.0
+gunicorn>=23.0,<24.0

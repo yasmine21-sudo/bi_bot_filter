@@ -1,7 +1,7 @@
 """Small local web dashboard for the BI screenshot bot.
 
 Three panels:
-  * Destinataires  – manage the recipients (reads/writes destinataire.xlsx)
+  * Destinataires  – manage the recipients (reads/writes data/destinataire.xlsx)
   * Paramètres     – edit the key project settings (reads/writes .env)
   * Exécution      – launch a run and watch live progress + ETA (reads logs/status.json)
 
@@ -26,7 +26,8 @@ import main as bot
 
 ROOT = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"
-RECIPIENTS_PATH = ROOT / "destinataire.xlsx"
+DATA_DIR = Path(os.getenv("BIBOT_DATA_DIR", str(ROOT / "data")))
+RECIPIENTS_PATH = DATA_DIR / "destinataire.xlsx"
 STATUS_PATH = ROOT / "logs" / "status.json"
 LOG_PATH = ROOT / "logs" / "pbirs_capture.log"
 RECIPIENTS_HEADER = ["Filiale", "Email distinataire AA", "Email cc"]
@@ -135,6 +136,7 @@ def read_recipients() -> list[dict]:
 
 
 def write_recipients(recipients: list[dict]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     # Back up the current workbook before overwriting.
     if RECIPIENTS_PATH.exists():
         backup = RECIPIENTS_PATH.with_name(
@@ -221,21 +223,8 @@ def api_run():
     if is_running():
         return jsonify({"ok": False, "error": "Une exécution est déjà en cours."}), 409
 
-    payload = request.get_json(silent=True) or {}
-    test_mode = bool(payload.get("test_mode"))
-    test_email = (payload.get("test_email") or "").strip()
-
     run_env = os.environ.copy()
-    if test_mode:
-        if not test_email:
-            test_email = read_env().get("TEST_EMAIL_TO", "").strip()
-        if not test_email:
-            return jsonify({"ok": False, "error": "Renseignez une adresse e-mail de test."}), 400
-        # Persist for next time and pass it to the subprocess.
-        write_env({"TEST_EMAIL_TO": test_email})
-        run_env["TEST_EMAIL_TO"] = test_email
-
-    script = "run_full_override.py" if test_mode and (ROOT / "run_full_override.py").exists() else "main.py"
+    script = "main.py"
 
     # Seed the status file so the UI reacts immediately.
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -244,7 +233,7 @@ def api_run():
         encoding="utf-8",
     )
     _run_process = subprocess.Popen([sys.executable, script], cwd=str(ROOT), env=run_env)
-    return jsonify({"ok": True, "script": script, "test_email": test_email if test_mode else None})
+    return jsonify({"ok": True, "script": script})
 
 
 @app.post("/api/stop")
@@ -288,20 +277,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>BI Bot — Console</title>
+<title>BIBOT — Console</title>
 <style>
-  :root{--bg:#f1f5f9;--card:#fff;--ink:#1e293b;--muted:#64748b;--line:#e2e8f0;--brand:#4a6cf7;--ok:#16a34a;--warn:#d97706;--err:#dc2626;}
+  :root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--muted:#667085;--line:#e4e8f0;--brand:#3155d9;--brand-dark:#1d369c;--ok:#16a34a;--warn:#d97706;--err:#dc2626;}
   *{box-sizing:border-box;font-family:'Segoe UI',Arial,sans-serif;}
   body{margin:0;background:var(--bg);color:var(--ink);}
-  header{background:linear-gradient(135deg,#4a6cf7,#6366f1 50%,#8b5cf6);color:#fff;padding:20px 28px;}
-  header h1{margin:0;font-size:20px;}
-  header p{margin:4px 0 0;font-size:13px;opacity:.85;}
-  .tabs{display:flex;gap:4px;padding:0 28px;background:var(--card);border-bottom:1px solid var(--line);}
-  .tab{padding:14px 18px;cursor:pointer;border-bottom:3px solid transparent;color:var(--muted);font-weight:600;font-size:14px;}
+  header{position:relative;overflow:hidden;background:linear-gradient(120deg,#17285f 0%,#3155d9 56%,#5a45c7 100%);color:#fff;padding:22px max(28px,calc((100vw - 980px)/2 + 20px));box-shadow:0 6px 18px rgba(31,48,107,.16);}
+  header:after{content:"";position:absolute;width:280px;height:280px;right:-90px;top:-170px;border:38px solid rgba(255,255,255,.08);border-radius:50%;transform:rotate(25deg);}
+  .brand{position:relative;z-index:1;display:flex;align-items:center;gap:14px;}
+  .brand-tile{display:block;width:76px;height:52px;border:1px solid rgba(255,255,255,.42);border-radius:14px;background:#020817;box-shadow:inset 0 1px rgba(255,255,255,.18),0 8px 18px rgba(8,20,69,.18);object-fit:cover;object-position:center;}
+  header h1{margin:0;font-size:22px;line-height:1.1;letter-spacing:-.3px;}
+  header p{margin:6px 0 0;font-size:13px;opacity:.82;}
+  .tabs{display:flex;gap:4px;padding:0 max(28px,calc((100vw - 980px)/2 + 20px));background:var(--card);border-bottom:1px solid var(--line);}
+  .tab{padding:15px 18px;cursor:pointer;border-bottom:3px solid transparent;color:var(--muted);font-weight:600;font-size:14px;transition:color .2s,background .2s;}
+  .tab:hover{color:var(--brand);background:#f7f8ff;}
   .tab.active{color:var(--brand);border-color:var(--brand);}
   main{max-width:980px;margin:24px auto;padding:0 20px;}
   .panel{display:none;}.panel.active{display:block;}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:18px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 4px 14px rgba(31,41,71,.035);}
   h2{font-size:15px;margin:0 0 14px;}
   table{width:100%;border-collapse:collapse;}
   th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top;font-size:13px;}
@@ -329,12 +322,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
   pre{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:8px;overflow:auto;max-height:340px;font-size:12px;}
   .muted{color:var(--muted);font-size:12px;}
   .emails-cell{font-size:12px;color:var(--muted);}
+  @media (max-width:640px){header{padding:18px 20px}.tabs{padding:0 10px;overflow-x:auto}.tab{padding:13px 12px;white-space:nowrap}main{padding:0 12px;margin:16px auto}.grid{grid-template-columns:1fr}.card{padding:16px;overflow-x:auto}.brand-tile{width:64px;height:46px}}
 </style>
 </head>
 <body>
 <header>
-  <h1>BI Bot — Console</h1>
-  <p>Gérer les destinataires, configurer le projet et lancer une exécution.</p>
+  <div class="brand">
+    <img class="brand-tile" src="/static/logo.jpg" alt="BIBOT logo" />
+    <div><h1>BIBOT</h1><p>Automatisation des captures d'écrans de rapports</p></div>
+  </div>
 </header>
 <div class="tabs">
   <div class="tab active" data-tab="recipients">Destinataires</div>
@@ -346,7 +342,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <section class="panel active" id="panel-recipients">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-        <h2 style="margin:0;">Destinataires (destinataire.xlsx)</h2>
+        <h2 style="margin:0;">Destinataires</h2>
         <div class="row-actions">
           <button class="btn secondary" onclick="addRecipient()">+ Filiale</button>
           <button class="btn" onclick="saveRecipients()">Enregistrer</button>
@@ -373,8 +369,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div style="display:flex;justify-content:space-between;align-items:center;">
         <h2 style="margin:0;">Exécution</h2>
         <div class="row-actions">
-          <label class="muted"><input type="checkbox" id="test-mode" style="width:auto;" onchange="toggleTestEmail()"/> Mode test</label>
-          <input id="test-email" type="email" placeholder="adresse e-mail de test" style="width:230px;display:none;" title="Toutes les captures seront envoyées à cette adresse"/>
           <button class="btn" id="run-btn" onclick="startRun()">Lancer</button>
           <button class="btn secondary" id="stop-btn" onclick="stopRun()" style="display:none;background:#fee2e2;color:#dc2626;">Arrêter</button>
         </div>
@@ -472,16 +466,11 @@ async function saveSettings(){
 
 /* ---------- Run / status ---------- */
 function fmtEta(s){if(s===null||s===undefined)return '—';if(s<=0)return '0s';const m=Math.floor(s/60),ss=Math.round(s%60);return m>0?`${m}m ${ss}s`:`${ss}s`;}
-function toggleTestEmail(){$('#test-email').style.display=$('#test-mode').checked?'inline-block':'none';}
-async function loadTestEmail(){try{const j=await (await fetch('/api/test-email')).json();$('#test-email').value=j.value||'';}catch(e){}}
 async function startRun(){
-  const testMode=$('#test-mode').checked;
-  const testEmail=$('#test-email').value.trim();
-  if(testMode&&!testEmail){toast('Renseignez une adresse e-mail de test.');$('#test-email').focus();return;}
-  const res=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({test_mode:testMode,test_email:testEmail})});
+  const res=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
   const j=await res.json();
   if(!j.ok){toast(j.error||'Erreur');return;}
-  toast(testMode?('Test lancé → '+j.test_email):'Exécution lancée');
+  toast('Exécution lancée');
 }
 async function stopRun(){
   const res=await fetch('/api/stop',{method:'POST'});
@@ -512,7 +501,7 @@ async function pollStatus(){
 }
 async function refreshLogs(){$('#logs').textContent=await (await fetch('/api/logs')).text()||'—';}
 
-loadRecipients();loadSettings();loadTestEmail();pollStatus();refreshLogs();
+loadRecipients();loadSettings();pollStatus();refreshLogs();
 setInterval(pollStatus,2000);
 setInterval(()=>{if($('#panel-run').classList.contains('active'))refreshLogs();},5000);
 </script>
@@ -521,5 +510,7 @@ setInterval(()=>{if($('#panel-run').classList.contains('active'))refreshLogs();}
 
 
 if __name__ == "__main__":
-    print("BI Bot console running at http://127.0.0.1:8000")
-    app.run(host="127.0.0.1", port=8000, debug=False)
+    host = os.getenv("BIBOT_HOST", "0.0.0.0")
+    port = int(os.getenv("BIBOT_PORT", os.getenv("PORT", "8000")))
+    print(f"BIBOT console running at http://{host}:{port}")
+    app.run(host=host, port=port, debug=False)

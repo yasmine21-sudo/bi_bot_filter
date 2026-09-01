@@ -677,7 +677,9 @@ def _read_xlsx_rows(path: Path) -> list[list[str]]:
         return rows
 
 
-def load_recipient_mappings(path: str = "destinataire.xlsx") -> dict[str, RecipientGroup]:
+def load_recipient_mappings(path: str | None = None) -> dict[str, RecipientGroup]:
+    if path is None:
+        path = str(Path(os.getenv("BIBOT_DATA_DIR", ".")) / "destinataire.xlsx")
     workbook_path = Path(path)
     if not workbook_path.exists():
         raise FileNotFoundError(f"Recipient workbook was not found: {workbook_path}")

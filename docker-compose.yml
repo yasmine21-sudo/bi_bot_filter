@@ -1,0 +1,22 @@
+services:
+  bibot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bibot:latest
+    container_name: bibot
+    restart: unless-stopped
+    ports:
+      - "${BIBOT_PUBLISHED_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      BIBOT_HOST: 0.0.0.0
+      BIBOT_PORT: 8000
+      BIBOT_DATA_DIR: /app/data
+    volumes:
+      - ./.env:/app/.env
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./output:/app/output
+    init: true
