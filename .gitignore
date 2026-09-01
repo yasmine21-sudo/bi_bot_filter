@@ -1,5 +1,6 @@
 .venv/
 .browser-profile/
+.browser-profile-w*/
 output/
 logs/
 .env
@@ -16,6 +17,7 @@ ray-env/
 # Emails
 mail_message.txt
 destinataire.xlsx
+destinataire.backup_*.xlsx
 
 # Logs
 logs/
